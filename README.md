@@ -63,8 +63,9 @@ This agent:
 ### 1️⃣ Clone the Repository
 
 ```bash
-git clone https://github.com/yourusername/RAG-Delivery-Agent.git
-cd RAG-Delivery-Agent
+git clone https://github.com/Mit-Gandhi/RAG-Based-Delivery-Agent.git
+cd backend
+cd RAG-Based-Delivery-Agent
 ```
 
 ### 2️⃣ Install Dependencies
