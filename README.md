@@ -15,7 +15,7 @@
   <img src="https://img.shields.io/badge/TailwindCSS-%2306B6D4?style=for-the-badge&logo=tailwind-css&logoColor=white" />
 </p>
 
-# Collaborator
+#### Collaborator
 
 | Name | GitHub |
 |------|--------|
