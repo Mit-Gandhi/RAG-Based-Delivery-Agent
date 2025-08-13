@@ -1,7 +1,7 @@
 // API functions to communicate with your Python backend
 // You'll need to implement these endpoints in your Python backend
 
-const API_BASE_URL = 'http://localhost:8000'; // Adjust this to your Python server URL
+const API_BASE_URL = 'https://rag-based-delivery-agent.onrender.com'; // Adjust this to your Python server URL
 
 export interface ChatResponse {
   answer: string;
