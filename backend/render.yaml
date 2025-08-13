@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: rag-delivery-agent
+    name: RAG-Based-Delivery-Agent
     env: python
     plan: free
     buildCommand: cd backend && pip install -r requirements.txt
