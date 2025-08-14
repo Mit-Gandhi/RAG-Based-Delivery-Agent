@@ -342,7 +342,7 @@ app = FastAPI(title="RAG-Based Delivery Agent", description="AI Assistant with d
 # Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["https://rag-based-delivery-agent.vercel.app"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
