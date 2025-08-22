@@ -919,11 +919,12 @@ const VoiceChatbot = () => {
     setIsProcessing(true);
 
     try {
-      // Call your backend API
-      const response = await fetch('http://localhost:8000/chat', {
+      // Call your hosted backend API
+      const response = await fetch('https://rag-based-delivery-agent.onrender.com/chat', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
+          'Accept': 'application/json',
         },
         body: JSON.stringify({
           message: inputText,
@@ -932,28 +933,34 @@ const VoiceChatbot = () => {
       });
 
       if (!response.ok) {
-        throw new Error(`HTTP error! status: ${response.status}`);
+        const errorText = await response.text();
+        throw new Error(`Backend error (${response.status}): ${errorText}`);
       }
 
       const data = await response.json();
       
-      if (data.success && data.response) {
-        addMessage('ai', data.response);
+      if (data && (data.response || data.answer)) {
+        const aiResponse = data.response || data.answer;
+        addMessage('ai', aiResponse);
         
         // Convert AI response to speech
         if ('speechSynthesis' in window) {
-          speakText(data.response);
+          speakText(aiResponse);
         }
       } else {
-        throw new Error(data.error || 'No response received from backend');
+        throw new Error('No valid response received from backend');
       }
       
     } catch (error) {
       console.error('Error processing user input:', error);
       let errorMessage;
       
-      if (error.message.includes('fetch')) {
-        errorMessage = 'Could not connect to the backend server. Please make sure your backend is running on http://localhost:8000';
+      if (error.message.includes('Failed to fetch')) {
+        errorMessage = 'Could not connect to the backend server. The server might be waking up (Render free tier). Please try again in a moment.';
+      } else if (error.message.includes('CORS')) {
+        errorMessage = 'CORS error: Backend needs to allow requests from the frontend domain.';
+      } else if (error.message.includes('Backend error')) {
+        errorMessage = `Backend error: ${error.message}`;
       } else {
         errorMessage = `Sorry, I couldn't process your request: ${error.message}`;
       }
@@ -1470,7 +1477,7 @@ const VoiceChatbot = () => {
               <li>• The AI will process your speech and respond with both text and voice</li>
               <li>• Network errors are handled automatically with smart retry logic</li>
               <li>• If you see "Network unstable" - the system is auto-retrying</li>
-              <li>• Make sure your backend server is running on http://localhost:8000</li>
+              <li>• Backend: https://rag-based-delivery-agent.onrender.com (may take a moment to wake up)</li>
             </ul>
           </div>
 
