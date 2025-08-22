@@ -622,10 +622,48 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { Mic, MicOff, MessageCircle, Volume2, VolumeX, Loader2, Send } from 'lucide-react';
 
+// Web Speech API types
+interface SpeechRecognitionEvent extends Event {
+  results: SpeechRecognitionResultList;
+  resultIndex: number;
+}
+
+interface SpeechRecognitionErrorEvent extends Event {
+  error: string;
+  message: string;
+}
+
+interface SpeechRecognition extends EventTarget {
+  continuous: boolean;
+  interimResults: boolean;
+  lang: string;
+  start(): void;
+  stop(): void;
+  abort(): void;
+  onaudiostart: ((this: SpeechRecognition, ev: Event) => any) | null;
+  onaudioend: ((this: SpeechRecognition, ev: Event) => any) | null;
+  onend: ((this: SpeechRecognition, ev: Event) => any) | null;
+  onerror: ((this: SpeechRecognition, ev: SpeechRecognitionErrorEvent) => any) | null;
+  onresult: ((this: SpeechRecognition, ev: SpeechRecognitionEvent) => any) | null;
+  onstart: ((this: SpeechRecognition, ev: Event) => any) | null;
+}
+
+interface SpeechRecognitionStatic {
+  new(): SpeechRecognition;
+}
+
+declare global {
+  interface Window {
+    SpeechRecognition: SpeechRecognitionStatic;
+    webkitSpeechRecognition: SpeechRecognitionStatic;
+  }
+}
+
 const VoiceChatbot = () => {
   const [isConversationActive, setIsConversationActive] = useState(false);
   const [isListening, setIsListening] = useState(false);
   const [isProcessing, setIsProcessing] = useState(false);
+  const [isSpeaking, setIsSpeaking] = useState(false);
   const [messages, setMessages] = useState([]);
   const [connectionStatus, setConnectionStatus] = useState('disconnected');
   const [voiceLevel, setVoiceLevel] = useState(0);
@@ -633,6 +671,9 @@ const VoiceChatbot = () => {
   const [smoothedVoiceLevel, setSmoothedVoiceLevel] = useState(0);
   const [textInput, setTextInput] = useState('');
   const [isBackendReady, setIsBackendReady] = useState(false);
+  const [currentTranscript, setCurrentTranscript] = useState('');
+  const [speechSupported, setSpeechSupported] = useState(false);
+  
   const messagesEndRef = useRef(null);
   const audioContextRef = useRef(null);
   const analyserRef = useRef(null);
@@ -640,6 +681,8 @@ const VoiceChatbot = () => {
   const streamRef = useRef(null);
   const animationFrameRef = useRef(null);
   const smoothingFactorRef = useRef(0.8);
+  const speechRecognitionRef = useRef<SpeechRecognition | null>(null);
+  const silenceTimeoutRef = useRef<NodeJS.Timeout | null>(null);
 
   const API_BASE_URL = 'https://rag-based-delivery-agent.onrender.com';
 
@@ -650,6 +693,17 @@ const VoiceChatbot = () => {
   useEffect(() => {
     scrollToBottom();
   }, [messages]);
+
+  // Check for speech recognition support
+  useEffect(() => {
+    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (SpeechRecognition) {
+      setSpeechSupported(true);
+    } else {
+      console.warn('Speech recognition not supported in this browser');
+      setSpeechSupported(false);
+    }
+  }, []);
 
   // Check backend health on component mount
   useEffect(() => {
@@ -678,6 +732,131 @@ const VoiceChatbot = () => {
     }
   };
 
+  // Initialize speech recognition
+  const initializeSpeechRecognition = () => {
+    if (!speechSupported) return null;
+
+    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+    const recognition = new SpeechRecognition();
+    
+    recognition.continuous = true;
+    recognition.interimResults = true;
+    recognition.lang = 'en-US';
+
+    recognition.onstart = () => {
+      console.log('Speech recognition started');
+      setIsListening(true);
+    };
+
+    recognition.onresult = (event: SpeechRecognitionEvent) => {
+      let interimTranscript = '';
+      let finalTranscript = '';
+
+      for (let i = event.resultIndex; i < event.results.length; i++) {
+        const transcript = event.results[i][0].transcript;
+        if (event.results[i].isFinal) {
+          finalTranscript += transcript;
+        } else {
+          interimTranscript += transcript;
+        }
+      }
+
+      setCurrentTranscript(interimTranscript);
+
+      if (finalTranscript) {
+        console.log('Final transcript:', finalTranscript);
+        handleVoiceInput(finalTranscript);
+        setCurrentTranscript('');
+      }
+
+      // Reset silence timeout
+      if (silenceTimeoutRef.current) {
+        clearTimeout(silenceTimeoutRef.current);
+      }
+
+      // Set a timeout to stop listening after silence
+      silenceTimeoutRef.current = setTimeout(() => {
+        if (recognition && isListening) {
+          recognition.stop();
+        }
+      }, 3000); // 3 seconds of silence
+    };
+
+    recognition.onerror = (event: SpeechRecognitionErrorEvent) => {
+      console.error('Speech recognition error:', event.error);
+      if (event.error === 'not-allowed' || event.error === 'service-not-allowed') {
+        addMessage('ai', 'Microphone access denied. Please allow microphone access and try again.');
+      } else if (event.error === 'no-speech') {
+        console.log('No speech detected, restarting...');
+        if (isConversationActive) {
+          setTimeout(() => startListening(), 1000);
+        }
+      }
+      setIsListening(false);
+    };
+
+    recognition.onend = () => {
+      console.log('Speech recognition ended');
+      setIsListening(false);
+      setCurrentTranscript('');
+      
+      // Clear silence timeout
+      if (silenceTimeoutRef.current) {
+        clearTimeout(silenceTimeoutRef.current);
+        silenceTimeoutRef.current = null;
+      }
+
+      // Restart listening if conversation is still active and not processing
+      if (isConversationActive && !isProcessing && !isSpeaking) {
+        setTimeout(() => startListening(), 500);
+      }
+    };
+
+    return recognition;
+  };
+
+  // Handle voice input
+  const handleVoiceInput = async (transcript: string) => {
+    if (!transcript.trim()) return;
+
+    setIsListening(false);
+    await sendMessage(transcript, true);
+  };
+
+  // Start listening for voice input
+  const startListening = () => {
+    if (!speechSupported) {
+      addMessage('ai', 'Speech recognition is not supported in your browser. Please use a modern browser like Chrome.');
+      return;
+    }
+
+    if (!speechRecognitionRef.current) {
+      speechRecognitionRef.current = initializeSpeechRecognition();
+    }
+
+    if (speechRecognitionRef.current && !isListening && !isProcessing && !isSpeaking) {
+      try {
+        speechRecognitionRef.current.start();
+      } catch (error) {
+        console.error('Error starting speech recognition:', error);
+      }
+    }
+  };
+
+  // Stop listening
+  const stopListening = () => {
+    if (speechRecognitionRef.current) {
+      speechRecognitionRef.current.stop();
+    }
+    setIsListening(false);
+    setCurrentTranscript('');
+    
+    if (silenceTimeoutRef.current) {
+      clearTimeout(silenceTimeoutRef.current);
+      silenceTimeoutRef.current = null;
+    }
+  };
+
   // Initialize audio context and microphone for voice level detection
   const initializeAudioContext = async () => {
     try {
@@ -703,6 +882,7 @@ const VoiceChatbot = () => {
       startVoiceLevelDetection();
     } catch (error) {
       console.error('Error initializing audio context:', error);
+      addMessage('ai', 'Cannot access microphone. Please allow microphone access for voice features.');
     }
   };
 
@@ -718,7 +898,9 @@ const VoiceChatbot = () => {
         setVoiceLevel(0);
         setSmoothedVoiceLevel(0);
         setIsUserSpeaking(false);
-        animationFrameRef.current = requestAnimationFrame(detectVoiceLevel);
+        if (isConversationActive) {
+          animationFrameRef.current = requestAnimationFrame(detectVoiceLevel);
+        }
         return;
       }
       
@@ -746,7 +928,9 @@ const VoiceChatbot = () => {
       // Lower threshold for better speech detection
       setIsUserSpeaking(sensitiveLevel > 0.05);
       
-      animationFrameRef.current = requestAnimationFrame(detectVoiceLevel);
+      if (isConversationActive) {
+        animationFrameRef.current = requestAnimationFrame(detectVoiceLevel);
+      }
     };
     
     detectVoiceLevel();
@@ -784,6 +968,7 @@ const VoiceChatbot = () => {
   useEffect(() => {
     return () => {
       cleanupAudioContext();
+      stopListening();
     };
   }, []);
 
@@ -797,9 +982,59 @@ const VoiceChatbot = () => {
     setMessages(prev => [...prev, newMessage]);
   };
 
+  // Text-to-speech function
+  const speakText = async (text: string, language: string = 'en') => {
+    try {
+      setIsSpeaking(true);
+      
+      const response = await fetch(`${API_BASE_URL}/tts`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          text: text,
+          language: language
+        })
+      });
+      
+      if (response.ok) {
+        const data = await response.json();
+        if (data.success && data.audio_base64) {
+          const audio = new Audio(`data:audio/mp3;base64,${data.audio_base64}`);
+          
+          return new Promise<void>((resolve, reject) => {
+            audio.onended = () => {
+              setIsSpeaking(false);
+              resolve();
+            };
+            audio.onerror = () => {
+              setIsSpeaking(false);
+              reject(new Error('Audio playback failed'));
+            };
+            
+            audio.play().catch(e => {
+              console.error('Audio play failed:', e);
+              setIsSpeaking(false);
+              reject(e);
+            });
+          });
+        }
+      }
+    } catch (error) {
+      console.error('TTS error:', error);
+      setIsSpeaking(false);
+    }
+  };
+
   const startConversation = async () => {
     if (!isBackendReady) {
       addMessage('ai', 'Backend is not ready yet. Please wait for initialization to complete.');
+      return;
+    }
+
+    if (!speechSupported) {
+      addMessage('ai', 'Speech recognition is not supported in your browser. You can still use text chat below.');
       return;
     }
 
@@ -807,18 +1042,24 @@ const VoiceChatbot = () => {
       // Set conversation active immediately for instant UI transition
       setIsConversationActive(true);
       setConnectionStatus('connected');
-      setIsListening(true);
       
       // Initialize audio context for voice level detection
       await initializeAudioContext();
       
       addMessage('ai', 'Voice conversation started! I\'m listening for your questions about deliveries.');
       
+      // Speak the welcome message
+      await speakText('Voice conversation started! I\'m listening for your questions about deliveries.');
+      
+      // Start listening after welcome message
+      setTimeout(() => {
+        startListening();
+      }, 500);
+      
     } catch (error) {
       console.error('Failed to start conversation:', error);
       setConnectionStatus('disconnected');
       setIsConversationActive(false);
-      setIsListening(false);
       addMessage('ai', `Sorry, I couldn't start the voice conversation: ${error.message}`);
     }
   };
@@ -827,8 +1068,11 @@ const VoiceChatbot = () => {
     try {
       setIsConversationActive(false);
       setConnectionStatus('ready');
-      setIsListening(false);
+      
+      // Stop all voice activities
+      stopListening();
       setIsProcessing(false);
+      setIsSpeaking(false);
       
       // Cleanup audio context
       cleanupAudioContext();
@@ -840,11 +1084,17 @@ const VoiceChatbot = () => {
     }
   };
 
-  const sendMessage = async (message) => {
+  const sendMessage = async (message, isVoiceInput = false) => {
     if (!message.trim()) return;
     
     setIsProcessing(true);
-    addMessage('user', message);
+    
+    if (isVoiceInput) {
+      // For voice input, show what was heard
+      addMessage('user', `🎤 ${message}`);
+    } else {
+      addMessage('user', message);
+    }
     
     try {
       const response = await fetch(`${API_BASE_URL}/chat`, {
@@ -867,31 +1117,9 @@ const VoiceChatbot = () => {
       if (data.success) {
         addMessage('ai', data.answer);
         
-        // If conversation is active, try to speak the response
-        if (isConversationActive && data.detected_language) {
-          try {
-            const ttsResponse = await fetch(`${API_BASE_URL}/tts`, {
-              method: 'POST',
-              headers: {
-                'Content-Type': 'application/json',
-              },
-              body: JSON.stringify({
-                text: data.answer,
-                language: data.detected_language
-              })
-            });
-            
-            if (ttsResponse.ok) {
-              const ttsData = await ttsResponse.json();
-              if (ttsData.success && ttsData.audio_base64) {
-                // Play the audio
-                const audio = new Audio(`data:audio/mp3;base64,${ttsData.audio_base64}`);
-                audio.play().catch(e => console.log('Audio play failed:', e));
-              }
-            }
-          } catch (ttsError) {
-            console.log('TTS failed:', ttsError);
-          }
+        // If conversation is active and this was a voice input, speak the response
+        if (isConversationActive && isVoiceInput) {
+          await speakText(data.answer, data.detected_language || 'en');
         }
       } else {
         addMessage('ai', data.error || 'Sorry, I encountered an error processing your message.');
@@ -927,8 +1155,12 @@ const VoiceChatbot = () => {
 
   // Calculate dynamic scale based on voice level
   const getDynamicScale = () => {
-    if (!isListening) {
+    if (!isListening && !isSpeaking) {
       return 1.0;
+    }
+    
+    if (isSpeaking) {
+      return 1.5; // Larger when AI is speaking
     }
     
     if (!isUserSpeaking) {
@@ -944,7 +1176,8 @@ const VoiceChatbot = () => {
   };
   
   const getDynamicOpacity = () => {
-    if (!isListening) return 0.3;
+    if (!isListening && !isSpeaking) return 0.3;
+    if (isSpeaking) return 0.8;
     if (!isUserSpeaking) return 0.5;
     
     const minOpacity = 0.3;
@@ -953,6 +1186,7 @@ const VoiceChatbot = () => {
   };
   
   const getAnimationDuration = () => {
+    if (isSpeaking) return 1.0;
     if (!isListening || !isUserSpeaking) return 2;
     
     const minDuration = 0.3;
@@ -963,6 +1197,10 @@ const VoiceChatbot = () => {
   const getAnimationStyle = () => {
     if (isProcessing) {
       return 'processing 1.5s ease-in-out infinite';
+    }
+    
+    if (isSpeaking) {
+      return 'speaking 1s ease-in-out infinite';
     }
     
     if (isListening) {
@@ -982,7 +1220,7 @@ const VoiceChatbot = () => {
       case 'ready':
         return { color: 'bg-green-500', text: 'Ready' };
       case 'connected':
-        return { color: 'bg-blue-500', text: 'Active' };
+        return { color: 'bg-blue-500', text: 'Voice Active' };
       case 'backend_not_ready':
         return { color: 'bg-yellow-500', text: 'Starting' };
       case 'backend_error':
@@ -1006,7 +1244,7 @@ const VoiceChatbot = () => {
               </div>
               <div>
                 <h1 className="text-2xl font-bold text-gray-800">RAG Delivery Assistant</h1>
-                <p className="text-gray-600">Ask questions about deliveries</p>
+                <p className="text-gray-600">Voice-enabled delivery expert</p>
               </div>
             </div>
             
@@ -1028,9 +1266,14 @@ const VoiceChatbot = () => {
                 </div>
                 <p className="text-gray-500">
                   {isBackendReady 
-                    ? "Ready to help with delivery questions! Start a conversation or type below."
+                    ? "Ready to help with delivery questions! Start voice mode or type below."
                     : "Initializing delivery assistant... Please wait."}
                 </p>
+                {!speechSupported && (
+                  <p className="text-orange-500 text-sm mt-2">
+                    Speech recognition not supported. Text chat is available.
+                  </p>
+                )}
               </div>
             ) : (
               messages.map((message) => (
@@ -1058,6 +1301,20 @@ const VoiceChatbot = () => {
             <div ref={messagesEndRef} />
           </div>
         </div>
+
+        {/* Current Transcript Display */}
+        {currentTranscript && (
+          <div className="bg-yellow-50 border-l-4 border-yellow-400 p-4">
+            <div className="flex">
+              <Mic className="w-5 h-5 text-yellow-600 animate-pulse" />
+              <div className="ml-3">
+                <p className="text-sm text-yellow-800">
+                  Listening: <span className="italic">"{currentTranscript}"</span>
+                </p>
+              </div>
+            </div>
+          </div>
+        )}
 
         {/* Text Input Form */}
         <div className="bg-white shadow-lg p-4 border-t border-gray-200">
@@ -1097,6 +1354,13 @@ const VoiceChatbot = () => {
               </div>
             )}
             
+            {isSpeaking && (
+              <div className="flex items-center space-x-2 text-purple-600">
+                <Volume2 className="w-5 h-5 animate-pulse" />
+                <span className="text-sm font-medium">AI is speaking...</span>
+              </div>
+            )}
+            
             {isProcessing && (
               <div className="flex items-center space-x-2 text-blue-600">
                 <Loader2 className="w-5 h-5 animate-spin" />
@@ -1104,7 +1368,7 @@ const VoiceChatbot = () => {
               </div>
             )}
             
-            {!isListening && !isProcessing && isBackendReady && (
+            {!isListening && !isProcessing && !isSpeaking && isBackendReady && (
               <div className="flex items-center space-x-2 text-gray-500">
                 <Volume2 className="w-5 h-5" />
                 <span className="text-sm">Ready for questions</span>
@@ -1132,9 +1396,9 @@ const VoiceChatbot = () => {
               }`}>
                 <button
                   onClick={startConversation}
-                  disabled={!isBackendReady}
+                  disabled={!isBackendReady || !speechSupported}
                   className={`flex items-center space-x-3 px-8 py-4 rounded-full font-semibold text-lg transition-all duration-150 transform hover:scale-105 disabled:opacity-50 disabled:cursor-not-allowed ${
-                    !isBackendReady
+                    !isBackendReady || !speechSupported
                       ? 'bg-gray-400 text-white shadow-lg'
                       : 'bg-indigo-600 hover:bg-indigo-700 text-white shadow-lg'
                   }`}
@@ -1143,6 +1407,11 @@ const VoiceChatbot = () => {
                     <>
                       <Loader2 className="w-6 h-6 animate-spin" />
                       <span>Initializing...</span>
+                    </>
+                  ) : !speechSupported ? (
+                    <>
+                      <MicOff className="w-6 h-6" />
+                      <span>Voice Not Supported</span>
                     </>
                   ) : (
                     <>
@@ -1160,12 +1429,14 @@ const VoiceChatbot = () => {
                 <div className="relative transform -translate-y-2">
                   {/* Outer breathing circle */}
                   <div 
-                    className="absolute inset-0 rounded-full bg-green-200"
+                    className={`absolute inset-0 rounded-full ${
+                      isSpeaking ? 'bg-purple-200' : 'bg-green-200'
+                    }`}
                     style={{
                       animation: getAnimationStyle(),
                       transform: `scale(${getDynamicScale()})`,
                       opacity: getDynamicOpacity(),
-                      transition: isListening && isUserSpeaking 
+                      transition: (isListening && isUserSpeaking) || isSpeaking
                         ? 'transform 0.1s ease-out, opacity 0.1s ease-out'
                         : 'transform 0.3s ease-out, opacity 0.3s ease-out'
                     }}
@@ -1194,10 +1465,34 @@ const VoiceChatbot = () => {
                       )}
                     </>
                   )}
+
+                  {/* AI speaking pulse rings */}
+                  {isSpeaking && (
+                    <>
+                      <div 
+                        className="absolute inset-0 rounded-full bg-purple-400"
+                        style={{
+                          transform: `scale(${getDynamicScale() * 1.2})`,
+                          opacity: 0.4,
+                          animation: 'speaking-pulse 1s ease-in-out infinite'
+                        }}
+                      />
+                      <div 
+                        className="absolute inset-0 rounded-full bg-purple-500"
+                        style={{
+                          transform: `scale(${getDynamicScale() * 1.4})`,
+                          opacity: 0.2,
+                          animation: 'speaking-pulse 1.2s ease-in-out infinite'
+                        }}
+                      />
+                    </>
+                  )}
                   
                   {/* Inner microphone button */}
                   <div className={`relative z-10 w-20 h-20 rounded-full flex items-center justify-center transition-all duration-200 ${
-                    isConversationActive && isListening 
+                    isSpeaking 
+                      ? 'bg-purple-600 shadow-xl shadow-purple-600/70'
+                      : isConversationActive && isListening 
                       ? isUserSpeaking
                         ? 'bg-green-600 shadow-xl shadow-green-600/70'
                         : 'bg-green-500 shadow-lg shadow-green-500/50'
@@ -1206,13 +1501,15 @@ const VoiceChatbot = () => {
                       : 'bg-green-500 shadow-lg shadow-green-500/50'
                   }`}
                   style={{
-                    transform: isListening && isUserSpeaking 
-                      ? `scale(${1 + smoothedVoiceLevel * 0.1})` 
+                    transform: (isListening && isUserSpeaking) || isSpeaking
+                      ? `scale(${1 + (smoothedVoiceLevel || 0.3) * 0.1})` 
                       : 'scale(1)',
                     transition: 'transform 0.1s ease-out'
                   }}>
                     {isProcessing ? (
                       <Loader2 className="w-8 h-8 text-white animate-spin" />
+                    ) : isSpeaking ? (
+                      <Volume2 className="w-8 h-8 text-white" />
                     ) : (
                       <Mic className={`w-8 h-8 text-white ${
                         isUserSpeaking ? 'drop-shadow-lg' : ''
@@ -1242,6 +1539,17 @@ const VoiceChatbot = () => {
                   <span>Stop Voice</span>
                 </button>
 
+                {/* Manual Listen Button (for debugging) */}
+                {isConversationActive && !isListening && !isProcessing && !isSpeaking && (
+                  <button
+                    onClick={startListening}
+                    className="flex items-center space-x-3 px-6 py-3 bg-green-500 hover:bg-green-600 text-white rounded-full font-medium transition-all duration-150 transform hover:scale-105"
+                  >
+                    <Mic className="w-5 h-5" />
+                    <span>Listen</span>
+                  </button>
+                )}
+
                 {/* Clear Chat Button */}
                 {messages.length > 0 && (
                   <button
@@ -1269,12 +1577,22 @@ const VoiceChatbot = () => {
           <div className="mt-6 p-4 bg-blue-50 rounded-xl">
             <h3 className="font-semibold text-blue-800 mb-2">How to use:</h3>
             <ul className="text-sm text-blue-700 space-y-1">
-              <li>• Type questions in the text box for instant responses</li>
-              <li>• Click "Start Voice Mode" for voice interaction with TTS responses</li>
+              <li>• Type questions in the text box for instant text responses</li>
+              <li>• Click "Start Voice Mode" to enable voice conversation</li>
+              <li>• Speak clearly when the green circle is pulsing (listening mode)</li>
+              <li>• AI will respond with voice when purple circle appears (speaking mode)</li>
               <li>• Ask about delivery procedures, routes, policies, and guidelines</li>
-              <li>• The AI responds based on the uploaded delivery manual</li>
-              <li>• Use "Clear Chat" to start a fresh conversation</li>
+              <li>• The system automatically detects when you stop speaking</li>
+              <li>• Use "Clear Chat" to reset the conversation context</li>
             </ul>
+            {!speechSupported && (
+              <div className="mt-3 p-3 bg-orange-100 rounded-lg">
+                <p className="text-orange-800 text-sm">
+                  <strong>Note:</strong> Speech recognition is not supported in your browser. 
+                  Please use Chrome, Edge, or Safari for voice features. Text chat is fully functional.
+                </p>
+              </div>
+            )}
           </div>
         </div>
       </div>
@@ -1300,6 +1618,32 @@ const VoiceChatbot = () => {
           50% {
             transform: scale(1.3);
             opacity: 0.4;
+          }
+        }
+
+        @keyframes speaking {
+          0%, 100% {
+            transform: scale(1.3);
+            opacity: 0.8;
+          }
+          50% {
+            transform: scale(1.6);
+            opacity: 0.4;
+          }
+        }
+
+        @keyframes speaking-pulse {
+          0% {
+            transform: scale(0.8);
+            opacity: 0.6;
+          }
+          50% {
+            transform: scale(1);
+            opacity: 0.3;
+          }
+          100% {
+            transform: scale(1.2);
+            opacity: 0;
           }
         }
         
