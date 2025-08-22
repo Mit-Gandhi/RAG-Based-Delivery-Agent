@@ -620,7 +620,7 @@
 
 
 import React, { useState, useEffect, useRef } from 'react';
-import { Mic, MicOff, MessageCircle, Volume2, VolumeX, Loader2 } from 'lucide-react';
+import { Mic, MicOff, MessageCircle, Volume2, VolumeX, Loader2, AlertTriangle } from 'lucide-react';
 
 const VoiceChatbot = () => {
   const [isConversationActive, setIsConversationActive] = useState(false);
@@ -632,6 +632,7 @@ const VoiceChatbot = () => {
   const [isUserSpeaking, setIsUserSpeaking] = useState(false);
   const [smoothedVoiceLevel, setSmoothedVoiceLevel] = useState(0);
   const [transcript, setTranscript] = useState('');
+  const [networkErrorCount, setNetworkErrorCount] = useState(0);
   
   const messagesEndRef = useRef(null);
   const audioContextRef = useRef(null);
@@ -641,8 +642,9 @@ const VoiceChatbot = () => {
   const animationFrameRef = useRef(null);
   const smoothingFactorRef = useRef(0.8);
   const recognitionRef = useRef(null);
-  const speechSynthesisRef = useRef(null);
   const isManualStopRef = useRef(false);
+  const reconnectTimeoutRef = useRef(null);
+  const recognitionStartTimeRef = useRef(null);
 
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -657,27 +659,77 @@ const VoiceChatbot = () => {
     return 'webkitSpeechRecognition' in window || 'SpeechRecognition' in window;
   };
 
-  // Initialize speech recognition
-  const initializeSpeechRecognition = () => {
+  // Restart recognition with smart retry logic
+  const restartRecognition = (delay = 1000) => {
+    if (isManualStopRef.current || !isConversationActive) return;
+    
+    // Clear any existing timeout
+    if (reconnectTimeoutRef.current) {
+      clearTimeout(reconnectTimeoutRef.current);
+    }
+
+    reconnectTimeoutRef.current = setTimeout(() => {
+      if (!isManualStopRef.current && isConversationActive && recognitionRef.current) {
+        try {
+          console.log('Attempting to restart speech recognition...');
+          recognitionRef.current.start();
+          recognitionStartTimeRef.current = Date.now();
+        } catch (error) {
+          console.error('Failed to restart recognition:', error);
+          // If we can't restart, try creating a new instance
+          if (networkErrorCount < 5) {
+            setTimeout(() => {
+              initializeNewRecognition();
+            }, 2000);
+          }
+        }
+      }
+    }, delay);
+  };
+
+  // Initialize a completely new recognition instance
+  const initializeNewRecognition = () => {
+    if (recognitionRef.current) {
+      try {
+        recognitionRef.current.abort();
+      } catch (e) {
+        console.log('Recognition abort failed, continuing...');
+      }
+    }
+    
+    recognitionRef.current = createSpeechRecognition();
+    if (recognitionRef.current && !isManualStopRef.current && isConversationActive) {
+      try {
+        recognitionRef.current.start();
+        recognitionStartTimeRef.current = Date.now();
+      } catch (error) {
+        console.error('Failed to start new recognition instance:', error);
+      }
+    }
+  };
+
+  // Create speech recognition instance
+  const createSpeechRecognition = () => {
     if (!isSpeechRecognitionSupported()) {
       console.error('Speech recognition not supported');
-      addMessage('ai', 'Speech recognition is not supported in your browser. Please use Chrome or Safari.');
+      addMessage('ai', 'Speech recognition is not supported in your browser. Please use Chrome, Safari, or Edge.');
       return null;
     }
 
     const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
     const recognition = new SpeechRecognition();
     
-    // More conservative settings to avoid network errors
-    recognition.continuous = false; // Changed to false for better stability
+    // Optimized settings to minimize network errors
+    recognition.continuous = false; // Use short sessions to avoid timeouts
     recognition.interimResults = true;
     recognition.lang = 'en-US';
     recognition.maxAlternatives = 1;
 
     recognition.onstart = () => {
-      console.log('Speech recognition started');
+      console.log('Speech recognition started successfully');
       setIsListening(true);
       setConnectionStatus('connected');
+      recognitionStartTimeRef.current = Date.now();
     };
 
     recognition.onresult = (event) => {
@@ -695,10 +747,11 @@ const VoiceChatbot = () => {
 
       setTranscript(interimTranscript);
 
-      if (finalTranscript) {
-        console.log('Final transcript:', finalTranscript);
+      if (finalTranscript.trim()) {
+        console.log('Final transcript received:', finalTranscript);
         handleUserInput(finalTranscript);
         setTranscript('');
+        setNetworkErrorCount(0); // Reset error count on successful recognition
       }
     };
 
@@ -706,113 +759,80 @@ const VoiceChatbot = () => {
       console.error('Speech recognition error:', event.error);
       setIsListening(false);
       
-      // More specific error handling
+      const timeSinceStart = recognitionStartTimeRef.current ? Date.now() - recognitionStartTimeRef.current : 0;
+      
       switch (event.error) {
         case 'network':
-          addMessage('ai', 'Network connection lost. Retrying in 2 seconds...');
-          // Auto-retry after network error
-          if (!isManualStopRef.current && isConversationActive) {
-            setTimeout(() => {
-              if (recognitionRef.current && isConversationActive) {
-                try {
-                  console.log('Retrying speech recognition after network error...');
-                  recognitionRef.current.start();
-                } catch (retryError) {
-                  console.error('Retry failed:', retryError);
-                  setConnectionStatus('disconnected');
-                }
-              }
-            }, 2000);
+          setNetworkErrorCount(prev => prev + 1);
+          
+          // If error happens immediately after start, it's likely a persistent issue
+          if (timeSinceStart < 2000) {
+            console.log('Immediate network error detected, using longer retry delay');
+            if (networkErrorCount < 3) {
+              addMessage('ai', `Network connection unstable. Retrying... (${networkErrorCount + 1}/3)`);
+              restartRecognition(3000 + (networkErrorCount * 2000)); // Progressive delay
+            } else {
+              addMessage('ai', 'Network connection is unstable. Speech recognition will retry automatically when you speak again.');
+              setConnectionStatus('error');
+              // Keep trying but with longer delays
+              restartRecognition(10000);
+            }
+          } else {
+            // Network error after some time - restart quickly
+            console.log('Network error during session, quick restart');
+            restartRecognition(1000);
           }
           break;
           
         case 'not-allowed':
-          addMessage('ai', 'Microphone access denied. Please refresh the page and allow microphone permissions.');
+          addMessage('ai', 'Microphone access was denied. Please refresh the page and allow microphone permissions.');
           setConnectionStatus('disconnected');
+          setIsConversationActive(false);
           break;
           
         case 'no-speech':
-          // Silently restart for no-speech errors
-          if (!isManualStopRef.current && isConversationActive) {
-            setTimeout(() => {
-              if (recognitionRef.current && isConversationActive) {
-                try {
-                  recognitionRef.current.start();
-                } catch (error) {
-                  console.error('Error restarting after no-speech:', error);
-                }
-              }
-            }, 500);
-          }
-          break;
-          
-        case 'aborted':
-          // Recognition was aborted, restart if conversation is active
-          if (!isManualStopRef.current && isConversationActive) {
-            setTimeout(() => {
-              if (recognitionRef.current && isConversationActive) {
-                try {
-                  recognitionRef.current.start();
-                } catch (error) {
-                  console.error('Error restarting after abort:', error);
-                }
-              }
-            }, 100);
-          }
+          console.log('No speech detected, restarting...');
+          restartRecognition(500);
           break;
           
         case 'audio-capture':
-          addMessage('ai', 'Audio capture failed. Please check your microphone and try again.');
+          addMessage('ai', 'Audio capture failed. Please check your microphone.');
+          restartRecognition(2000);
+          break;
+          
+        case 'service-not-allowed':
+          addMessage('ai', 'Speech recognition service is not allowed. Please check your browser settings.');
           setConnectionStatus('disconnected');
           break;
           
+        case 'aborted':
+          // Don't show error for aborted - usually intentional
+          if (!isManualStopRef.current) {
+            console.log('Recognition aborted unexpectedly, restarting...');
+            restartRecognition(1000);
+          }
+          break;
+          
         default:
-          addMessage('ai', `Speech recognition error: ${event.error}. Retrying...`);
-          // Generic retry for other errors
-          if (!isManualStopRef.current && isConversationActive) {
-            setTimeout(() => {
-              if (recognitionRef.current && isConversationActive) {
-                try {
-                  recognitionRef.current.start();
-                } catch (error) {
-                  console.error('Generic retry failed:', error);
-                  setConnectionStatus('disconnected');
-                }
-              }
-            }, 1000);
+          console.log(`Handling generic error: ${event.error}`);
+          if (networkErrorCount < 5) {
+            restartRecognition(2000);
+          } else {
+            addMessage('ai', 'Speech recognition is experiencing issues. Please refresh the page if problems persist.');
+            setConnectionStatus('error');
           }
           break;
       }
     };
 
     recognition.onend = () => {
-      console.log('Speech recognition ended');
+      console.log('Speech recognition session ended');
       setIsListening(false);
       
-      // Auto-restart recognition if conversation is still active
+      // Auto-restart if conversation is active and not manually stopped
       if (!isManualStopRef.current && isConversationActive) {
-        setTimeout(() => {
-          if (recognitionRef.current && isConversationActive) {
-            try {
-              console.log('Auto-restarting speech recognition...');
-              recognitionRef.current.start();
-            } catch (error) {
-              console.error('Error auto-restarting recognition:', error);
-              // Try one more time after a longer delay
-              setTimeout(() => {
-                if (recognitionRef.current && isConversationActive) {
-                  try {
-                    recognitionRef.current.start();
-                  } catch (secondError) {
-                    console.error('Second restart attempt failed:', secondError);
-                    setConnectionStatus('disconnected');
-                    addMessage('ai', 'Speech recognition stopped unexpectedly. Please restart the conversation.');
-                  }
-                }
-              }, 2000);
-            }
-          }
-        }, 100);
+        console.log('Auto-restarting speech recognition...');
+        restartRecognition(100); // Quick restart for normal end events
       }
     };
 
@@ -844,7 +864,7 @@ const VoiceChatbot = () => {
       startVoiceLevelDetection();
     } catch (error) {
       console.error('Error initializing audio context:', error);
-      addMessage('ai', 'Could not access microphone. Please allow microphone permissions.');
+      addMessage('ai', 'Could not access microphone. Please allow microphone permissions and refresh the page.');
     }
   };
 
@@ -856,13 +876,10 @@ const VoiceChatbot = () => {
     const dataArray = new Uint8Array(bufferLength);
     
     const detectVoiceLevel = () => {
-      if (!analyserRef.current) {
+      if (!analyserRef.current || !isConversationActive) {
         setVoiceLevel(0);
         setSmoothedVoiceLevel(0);
         setIsUserSpeaking(false);
-        if (isConversationActive) {
-          animationFrameRef.current = requestAnimationFrame(detectVoiceLevel);
-        }
         return;
       }
       
@@ -902,23 +919,7 @@ const VoiceChatbot = () => {
     setIsProcessing(true);
 
     try {
-      // For demo purposes - replace with your actual backend API
-      // Simulated AI response
-      const simulatedResponses = [
-        "I understand your query about delivery. Let me help you with that.",
-        "Thank you for your question. I'm here to assist with delivery-related inquiries.",
-        "I've received your message. How else can I help you today?",
-        "Great question! I'm processing your delivery request now.",
-        "I'm your AI delivery assistant. How can I make your delivery experience better?"
-      ];
-      
-      const randomResponse = simulatedResponses[Math.floor(Math.random() * simulatedResponses.length)];
-      
-      // Simulate API delay
-      await new Promise(resolve => setTimeout(resolve, 1000));
-      
-      // Uncomment and modify this section when you have your backend ready:
-      /*
+      // Call your backend API
       const response = await fetch('http://localhost:8000/chat', {
         method: 'POST',
         headers: {
@@ -930,6 +931,10 @@ const VoiceChatbot = () => {
         }),
       });
 
+      if (!response.ok) {
+        throw new Error(`HTTP error! status: ${response.status}`);
+      }
+
       const data = await response.json();
       
       if (data.success && data.response) {
@@ -940,21 +945,19 @@ const VoiceChatbot = () => {
           speakText(data.response);
         }
       } else {
-        throw new Error(data.error || 'Failed to get response');
-      }
-      */
-      
-      // For now, use simulated response
-      addMessage('ai', randomResponse);
-      
-      // Convert AI response to speech
-      if ('speechSynthesis' in window) {
-        speakText(randomResponse);
+        throw new Error(data.error || 'No response received from backend');
       }
       
     } catch (error) {
       console.error('Error processing user input:', error);
-      const errorMessage = `Sorry, I couldn't process your request: ${error.message}`;
+      let errorMessage;
+      
+      if (error.message.includes('fetch')) {
+        errorMessage = 'Could not connect to the backend server. Please make sure your backend is running on http://localhost:8000';
+      } else {
+        errorMessage = `Sorry, I couldn't process your request: ${error.message}`;
+      }
+      
       addMessage('ai', errorMessage);
       
       // Speak error message
@@ -986,7 +989,7 @@ const VoiceChatbot = () => {
     const preferredVoice = voices.find(voice => 
       voice.name.includes('Google') || 
       voice.name.includes('Microsoft') ||
-      voice.lang.startsWith('en')
+      (voice.lang.startsWith('en') && voice.localService)
     );
     
     if (preferredVoice) {
@@ -1040,8 +1043,19 @@ const VoiceChatbot = () => {
   const cleanupSpeechRecognition = () => {
     isManualStopRef.current = true;
     
+    // Clear any pending reconnection attempts
+    if (reconnectTimeoutRef.current) {
+      clearTimeout(reconnectTimeoutRef.current);
+      reconnectTimeoutRef.current = null;
+    }
+    
     if (recognitionRef.current) {
-      recognitionRef.current.stop();
+      try {
+        recognitionRef.current.stop();
+        recognitionRef.current.abort();
+      } catch (error) {
+        console.log('Error stopping recognition:', error);
+      }
       recognitionRef.current = null;
     }
     
@@ -1076,15 +1090,10 @@ const VoiceChatbot = () => {
         return;
       }
 
-      // Check if we're on HTTPS or localhost
-      if (location.protocol !== 'https:' && location.hostname !== 'localhost' && location.hostname !== '127.0.0.1') {
-        addMessage('ai', 'Speech recognition requires HTTPS or localhost. Please use a secure connection.');
-        return;
-      }
-
       setIsConversationActive(true);
       setConnectionStatus('connecting');
       isManualStopRef.current = false;
+      setNetworkErrorCount(0);
       
       // Request microphone permissions explicitly first
       try {
@@ -1094,31 +1103,30 @@ const VoiceChatbot = () => {
         console.error('Microphone permission denied:', permissionError);
         setConnectionStatus('disconnected');
         setIsConversationActive(false);
-        addMessage('ai', 'Microphone access is required. Please allow microphone permissions and try again.');
+        addMessage('ai', 'Microphone access is required. Please allow microphone permissions and refresh the page.');
         return;
       }
       
       // Initialize audio context for voice level detection
       await initializeAudioContext();
       
-      // Initialize speech recognition with a small delay to ensure everything is ready
-      setTimeout(() => {
+      // Initialize speech recognition
+      recognitionRef.current = createSpeechRecognition();
+      
+      if (recognitionRef.current) {
         try {
-          recognitionRef.current = initializeSpeechRecognition();
-          
-          if (recognitionRef.current) {
-            recognitionRef.current.start();
-            addMessage('ai', 'Conversation started! I\'m listening for your voice input. You can start speaking now.');
-          } else {
-            throw new Error('Failed to initialize speech recognition');
-          }
+          recognitionRef.current.start();
+          recognitionStartTimeRef.current = Date.now();
+          addMessage('ai', 'Conversation started! I\'m listening for your voice input. Speak clearly and I\'ll respond.');
         } catch (startError) {
           console.error('Error starting speech recognition:', startError);
           setConnectionStatus('disconnected');
           setIsConversationActive(false);
-          addMessage('ai', `Failed to start speech recognition: ${startError.message}. Please refresh the page and try again.`);
+          addMessage('ai', 'Failed to start speech recognition. Please refresh the page and try again.');
         }
-      }, 500);
+      } else {
+        throw new Error('Failed to create speech recognition instance');
+      }
       
     } catch (error) {
       console.error('Failed to start conversation:', error);
@@ -1134,6 +1142,7 @@ const VoiceChatbot = () => {
       setConnectionStatus('disconnected');
       setIsListening(false);
       setIsProcessing(false);
+      setNetworkErrorCount(0);
       
       // Cleanup speech recognition
       cleanupSpeechRecognition();
@@ -1141,18 +1150,10 @@ const VoiceChatbot = () => {
       // Cleanup audio context
       cleanupAudioContext();
       
-      addMessage('ai', 'Conversation ended. Thank you!');
+      addMessage('ai', 'Conversation ended. Thank you for using the voice assistant!');
     } catch (error) {
       console.error('Failed to stop conversation:', error);
       addMessage('ai', `Error stopping conversation: ${error.message}`);
-    }
-  };
-
-  const handleToggleConversation = () => {
-    if (isConversationActive) {
-      stopConversation();
-    } else {
-      startConversation();
     }
   };
 
@@ -1232,9 +1233,13 @@ const VoiceChatbot = () => {
             <div className="flex items-center space-x-2">
               <div className={`w-3 h-3 rounded-full ${
                 connectionStatus === 'connected' ? 'bg-green-500' : 
-                connectionStatus === 'connecting' ? 'bg-yellow-500' : 'bg-red-500'
+                connectionStatus === 'connecting' ? 'bg-yellow-500' : 
+                connectionStatus === 'error' ? 'bg-orange-500' : 'bg-red-500'
               }`} />
-              <span className="text-sm text-gray-600 capitalize">{connectionStatus}</span>
+              <span className="text-sm text-gray-600 capitalize flex items-center">
+                {connectionStatus}
+                {connectionStatus === 'error' && <AlertTriangle className="w-4 h-4 ml-1" />}
+              </span>
             </div>
           </div>
         </div>
@@ -1306,9 +1311,16 @@ const VoiceChatbot = () => {
             )}
             
             {!isListening && !isProcessing && isConversationActive && (
-              <div className="flex items-center space-x-2 text-gray-500">
+              <div className="flex items-center space-x-2 text-orange-500">
                 <Volume2 className="w-5 h-5" />
-                <span className="text-sm">Ready to listen</span>
+                <span className="text-sm">Reconnecting...</span>
+              </div>
+            )}
+
+            {networkErrorCount > 2 && (
+              <div className="flex items-center space-x-2 text-orange-600">
+                <AlertTriangle className="w-5 h-5" />
+                <span className="text-sm">Network unstable - Auto-retrying</span>
               </div>
             )}
           </div>
@@ -1325,7 +1337,7 @@ const VoiceChatbot = () => {
                 isConversationActive ? 'opacity-0 scale-90 pointer-events-none' : 'opacity-100 scale-100'
               }`}>
                 <button
-                  onClick={handleToggleConversation}
+                  onClick={startConversation}
                   disabled={connectionStatus === 'connecting'}
                   className={`flex items-center space-x-3 px-8 py-4 rounded-full font-semibold text-lg transition-all duration-150 transform hover:scale-105 disabled:opacity-50 disabled:cursor-not-allowed ${
                     connectionStatus === 'connecting'
@@ -1336,7 +1348,7 @@ const VoiceChatbot = () => {
                   {connectionStatus === 'connecting' ? (
                     <>
                       <Loader2 className="w-6 h-6 animate-spin" />
-                      <span>Connecting...</span>
+                      <span>Starting...</span>
                     </>
                   ) : (
                     <>
@@ -1454,13 +1466,29 @@ const VoiceChatbot = () => {
             <h3 className="font-semibold text-blue-800 mb-2">How to use:</h3>
             <ul className="text-sm text-blue-700 space-y-1">
               <li>• Click "Start Conversation" to begin voice interaction</li>
-              <li>• Speak your questions clearly when the system is listening</li>
-              <li>• The AI will respond with both text and voice</li>
-              <li>• Click "Stop Conversation" to end the session</li>
-              <li>• The outer circle grows and responds to your voice volume</li>
-              <li>• Your speech will appear as interim text while you speak</li>
+              <li>• Speak clearly when the microphone is active (green circle)</li>
+              <li>• The AI will process your speech and respond with both text and voice</li>
+              <li>• Network errors are handled automatically with smart retry logic</li>
+              <li>• If you see "Network unstable" - the system is auto-retrying</li>
+              <li>• Make sure your backend server is running on http://localhost:8000</li>
             </ul>
           </div>
+
+          {/* Network Status Info */}
+          {networkErrorCount > 0 && (
+            <div className="mt-4 p-3 bg-orange-50 border border-orange-200 rounded-lg">
+              <div className="flex items-center space-x-2">
+                <AlertTriangle className="w-5 h-5 text-orange-600" />
+                <span className="text-sm text-orange-800 font-medium">
+                  Network Issues Detected
+                </span>
+              </div>
+              <p className="text-xs text-orange-700 mt-1">
+                The speech recognition service experienced {networkErrorCount} network error(s). 
+                The system is automatically retrying. If problems persist, try refreshing the page.
+              </p>
+            </div>
+          )}
         </div>
       </div>
       
@@ -1509,6 +1537,7 @@ const VoiceChatbot = () => {
           100% {
             transform: scale(1.2);
             opacity: 0;
+            
           }
         }
         
