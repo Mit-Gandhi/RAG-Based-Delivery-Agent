@@ -668,7 +668,8 @@ const VoiceChatbot = () => {
     const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
     const recognition = new SpeechRecognition();
     
-    recognition.continuous = true;
+    // More conservative settings to avoid network errors
+    recognition.continuous = false; // Changed to false for better stability
     recognition.interimResults = true;
     recognition.lang = 'en-US';
     recognition.maxAlternatives = 1;
@@ -703,42 +704,112 @@ const VoiceChatbot = () => {
 
     recognition.onerror = (event) => {
       console.error('Speech recognition error:', event.error);
-      
-      if (event.error === 'network') {
-        addMessage('ai', 'Network error occurred. Please check your internet connection and try again.');
-        setConnectionStatus('disconnected');
-      } else if (event.error === 'not-allowed') {
-        addMessage('ai', 'Microphone access denied. Please allow microphone permissions and try again.');
-        setConnectionStatus('disconnected');
-      } else if (event.error === 'no-speech') {
-        // Don't show error for no-speech, just restart recognition
-        if (!isManualStopRef.current && isConversationActive) {
-          setTimeout(() => {
-            if (recognitionRef.current && isConversationActive) {
-              recognitionRef.current.start();
-            }
-          }, 100);
-        }
-      } else {
-        addMessage('ai', `Speech recognition error: ${event.error}. Please try again.`);
-        setConnectionStatus('disconnected');
-      }
-      
       setIsListening(false);
+      
+      // More specific error handling
+      switch (event.error) {
+        case 'network':
+          addMessage('ai', 'Network connection lost. Retrying in 2 seconds...');
+          // Auto-retry after network error
+          if (!isManualStopRef.current && isConversationActive) {
+            setTimeout(() => {
+              if (recognitionRef.current && isConversationActive) {
+                try {
+                  console.log('Retrying speech recognition after network error...');
+                  recognitionRef.current.start();
+                } catch (retryError) {
+                  console.error('Retry failed:', retryError);
+                  setConnectionStatus('disconnected');
+                }
+              }
+            }, 2000);
+          }
+          break;
+          
+        case 'not-allowed':
+          addMessage('ai', 'Microphone access denied. Please refresh the page and allow microphone permissions.');
+          setConnectionStatus('disconnected');
+          break;
+          
+        case 'no-speech':
+          // Silently restart for no-speech errors
+          if (!isManualStopRef.current && isConversationActive) {
+            setTimeout(() => {
+              if (recognitionRef.current && isConversationActive) {
+                try {
+                  recognitionRef.current.start();
+                } catch (error) {
+                  console.error('Error restarting after no-speech:', error);
+                }
+              }
+            }, 500);
+          }
+          break;
+          
+        case 'aborted':
+          // Recognition was aborted, restart if conversation is active
+          if (!isManualStopRef.current && isConversationActive) {
+            setTimeout(() => {
+              if (recognitionRef.current && isConversationActive) {
+                try {
+                  recognitionRef.current.start();
+                } catch (error) {
+                  console.error('Error restarting after abort:', error);
+                }
+              }
+            }, 100);
+          }
+          break;
+          
+        case 'audio-capture':
+          addMessage('ai', 'Audio capture failed. Please check your microphone and try again.');
+          setConnectionStatus('disconnected');
+          break;
+          
+        default:
+          addMessage('ai', `Speech recognition error: ${event.error}. Retrying...`);
+          // Generic retry for other errors
+          if (!isManualStopRef.current && isConversationActive) {
+            setTimeout(() => {
+              if (recognitionRef.current && isConversationActive) {
+                try {
+                  recognitionRef.current.start();
+                } catch (error) {
+                  console.error('Generic retry failed:', error);
+                  setConnectionStatus('disconnected');
+                }
+              }
+            }, 1000);
+          }
+          break;
+      }
     };
 
     recognition.onend = () => {
       console.log('Speech recognition ended');
       setIsListening(false);
       
-      // Restart recognition if conversation is still active and not manually stopped
+      // Auto-restart recognition if conversation is still active
       if (!isManualStopRef.current && isConversationActive) {
         setTimeout(() => {
           if (recognitionRef.current && isConversationActive) {
             try {
+              console.log('Auto-restarting speech recognition...');
               recognitionRef.current.start();
             } catch (error) {
-              console.error('Error restarting recognition:', error);
+              console.error('Error auto-restarting recognition:', error);
+              // Try one more time after a longer delay
+              setTimeout(() => {
+                if (recognitionRef.current && isConversationActive) {
+                  try {
+                    recognitionRef.current.start();
+                  } catch (secondError) {
+                    console.error('Second restart attempt failed:', secondError);
+                    setConnectionStatus('disconnected');
+                    addMessage('ai', 'Speech recognition stopped unexpectedly. Please restart the conversation.');
+                  }
+                }
+              }, 2000);
             }
           }
         }, 100);
@@ -831,7 +902,23 @@ const VoiceChatbot = () => {
     setIsProcessing(true);
 
     try {
-      // Send to your backend API
+      // For demo purposes - replace with your actual backend API
+      // Simulated AI response
+      const simulatedResponses = [
+        "I understand your query about delivery. Let me help you with that.",
+        "Thank you for your question. I'm here to assist with delivery-related inquiries.",
+        "I've received your message. How else can I help you today?",
+        "Great question! I'm processing your delivery request now.",
+        "I'm your AI delivery assistant. How can I make your delivery experience better?"
+      ];
+      
+      const randomResponse = simulatedResponses[Math.floor(Math.random() * simulatedResponses.length)];
+      
+      // Simulate API delay
+      await new Promise(resolve => setTimeout(resolve, 1000));
+      
+      // Uncomment and modify this section when you have your backend ready:
+      /*
       const response = await fetch('http://localhost:8000/chat', {
         method: 'POST',
         headers: {
@@ -854,6 +941,15 @@ const VoiceChatbot = () => {
         }
       } else {
         throw new Error(data.error || 'Failed to get response');
+      }
+      */
+      
+      // For now, use simulated response
+      addMessage('ai', randomResponse);
+      
+      // Convert AI response to speech
+      if ('speechSynthesis' in window) {
+        speakText(randomResponse);
       }
       
     } catch (error) {
@@ -976,7 +1072,13 @@ const VoiceChatbot = () => {
   const startConversation = async () => {
     try {
       if (!isSpeechRecognitionSupported()) {
-        addMessage('ai', 'Speech recognition is not supported in your browser. Please use Chrome or Safari.');
+        addMessage('ai', 'Speech recognition is not supported in your browser. Please use Chrome, Safari, or Edge.');
+        return;
+      }
+
+      // Check if we're on HTTPS or localhost
+      if (location.protocol !== 'https:' && location.hostname !== 'localhost' && location.hostname !== '127.0.0.1') {
+        addMessage('ai', 'Speech recognition requires HTTPS or localhost. Please use a secure connection.');
         return;
       }
 
@@ -984,18 +1086,39 @@ const VoiceChatbot = () => {
       setConnectionStatus('connecting');
       isManualStopRef.current = false;
       
+      // Request microphone permissions explicitly first
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        stream.getTracks().forEach(track => track.stop()); // Stop the test stream
+      } catch (permissionError) {
+        console.error('Microphone permission denied:', permissionError);
+        setConnectionStatus('disconnected');
+        setIsConversationActive(false);
+        addMessage('ai', 'Microphone access is required. Please allow microphone permissions and try again.');
+        return;
+      }
+      
       // Initialize audio context for voice level detection
       await initializeAudioContext();
       
-      // Initialize speech recognition
-      recognitionRef.current = initializeSpeechRecognition();
-      
-      if (recognitionRef.current) {
-        recognitionRef.current.start();
-        addMessage('ai', 'Conversation started! I\'m listening for your voice input. You can start speaking now.');
-      } else {
-        throw new Error('Failed to initialize speech recognition');
-      }
+      // Initialize speech recognition with a small delay to ensure everything is ready
+      setTimeout(() => {
+        try {
+          recognitionRef.current = initializeSpeechRecognition();
+          
+          if (recognitionRef.current) {
+            recognitionRef.current.start();
+            addMessage('ai', 'Conversation started! I\'m listening for your voice input. You can start speaking now.');
+          } else {
+            throw new Error('Failed to initialize speech recognition');
+          }
+        } catch (startError) {
+          console.error('Error starting speech recognition:', startError);
+          setConnectionStatus('disconnected');
+          setIsConversationActive(false);
+          addMessage('ai', `Failed to start speech recognition: ${startError.message}. Please refresh the page and try again.`);
+        }
+      }, 500);
       
     } catch (error) {
       console.error('Failed to start conversation:', error);
